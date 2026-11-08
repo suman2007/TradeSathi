@@ -23,7 +23,8 @@ T1_R, T2_R = 1.5, 2.0    # targets in multiples of risk
 BUY_SCORE = 4
 AVOID_SCORE = -3
 
-INTRA_RULE = "5min"      # candle size used for intraday analysis (built from 1-min data)
+INTRA_RULE = "5min"      # candle size for live intraday analysis. Keep it equal to the history check (5-min candles, the only
+                         # long history available): a different size means the EDGE verdicts describe other rules than the live ones
 REFRESH_SECONDS = 60
 
 # --- historical validation (backtest on DAILY candles) ---

@@ -9,6 +9,7 @@ import datetime as dt
 import time
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from tradesathi import config as cfg
@@ -65,8 +66,11 @@ def run_cycle(src, store, symbols, capital, now, daily_due, held=None, wants=Non
                          "error": next((x["error"] for x in results if x["symbol"] == sym), "no data")})
             continue
         key = f"{sym}|{h['buy_price']:.2f}"
-        m = manage(r, h["qty"], h["buy_price"], prev.get(key))
-        new_stops[key] = {"stop": m["stop"], "r": m["r"]}
+        p_old = prev.get(key)
+        since = (p_old.get("since") if isinstance(p_old, dict) else None) or now.date().isoformat()   # first day we saw it
+        days_held = int(np.busday_count(since, now.date().isoformat()))   # weekdays; exchange holidays are not handled
+        m = manage(r, h["qty"], h["buy_price"], p_old, days_held)
+        new_stops[key] = {"stop": m["stop"], "r": m["r"], "since": since}
         rows.append(m)
     store.write_json("stops.json", new_stops)
 

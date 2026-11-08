@@ -1,7 +1,13 @@
-"""Run:  streamlit run dashboard.py   (starts its own analysis engine)"""
+"""Run:  streamlit run dashboard.py   (keep main.py running in another terminal)
+
+Layout: left sidebar = names only (click one to open it); main area = one page at a time:
+Overview (portfolio + chart + holdings / buy list / buy-and-hold vs strategy), a share's detail page,
+New ideas, Paper trades, Historical check, Manage lists."""
+import datetime as dt
 import hmac
 import json
 import os
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -13,15 +19,15 @@ from tradesathi import engine
 from tradesathi.storage import holdings as hd
 from tradesathi.analysis import paper
 from tradesathi.storage import persist
-from tradesathi.analysis.history import hist_str
+from tradesathi.analysis.history import NO_HISTORY, hist_str
 from tradesathi.analysis.indicators import add_all
 from tradesathi.analysis.patterns import BIAS, detect
 from tradesathi.storage.store import Store
 from tradesathi.analysis.strategy import resample
 
-st.set_page_config(page_title="Trading Analyzer", layout="wide")
-st.title("Live Trading Analyzer")
+st.set_page_config(page_title="Trading Analyzer", layout="wide", initial_sidebar_state="expanded")
 store = Store()
+IST = ZoneInfo(cfg.TZ_NAME)
 
 
 def _secret(name):
@@ -43,9 +49,362 @@ if _pw and not st.session_state.get("authed"):
     st.stop()
 
 engine.ensure_started()         # background analysis thread (skipped if TRADESATHI_EXTERNAL_ENGINE=1, i.e. python -m tradesathi.main runs the engine)
-st.sidebar.caption(f"Your data is stored in: {persist.backend().name}")
+VERDICT_DOT = {"BUY NOW": "🟢", "PLACE LIMIT ORDER": "🔵", "WAIT": "🟡", "DO NOT BUY": "🔴"}
+st.session_state.setdefault("page", "overview")
+st.session_state.setdefault("sym", None)
 
-# ---- holdings input (outside the auto-refreshing part so edits are not lost) ----
+
+# ------------------------------------------------------------------ helpers
+def load_data():
+    path = os.path.join(cfg.DATA_DIR, "signals.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (ValueError, OSError):                     # engine is writing the file right now
+        return None
+
+
+def split(data):
+    """held_rows, wanted_rows, ok results, new ideas."""
+    held = {m["symbol"]: m for m in data.get("holdings", []) if "error" not in m}
+    wanted = {p["symbol"]: p for p in data.get("buylist", []) if "error" not in p}
+    ok = [r for r in data["results"] if "error" not in r]
+    ideas = [r for r in ok if r["symbol"] not in data.get("held", []) and r["symbol"] not in data.get("wanted", [])]
+    return held, wanted, ok, ideas
+
+
+def short(sym):
+    return sym.replace(".NS", "")
+
+
+def num(x, fmt="{:,.2f}"):
+    return "-" if x is None or (isinstance(x, float) and pd.isna(x)) else fmt.format(x)
+
+
+def _age(sec):
+    sec = int(max(sec, 0))
+    if sec < 90:
+        return f"{sec}s ago"
+    if sec < 5400:
+        return f"{sec // 60} min ago"
+    if sec < 172800:
+        return f"{sec // 3600} h ago"
+    return f"{sec // 86400} days ago"
+
+
+def market_state():
+    now = dt.datetime.now(IST)
+    return now, now.weekday() < 5 and dt.time(9, 15) <= now.time() <= dt.time(15, 30)
+
+
+def status_bar(updated_iso):
+    """Date + time of the data, how old it is, and whether the market is open."""
+    upd = dt.datetime.fromisoformat(updated_iso).astimezone(IST)
+    now, is_open = market_state()
+    age = (now - upd).total_seconds()
+    c = st.columns([3, 2, 2])
+    c[0].metric("Data as of (IST)", upd.strftime("%d %b %Y, %H:%M:%S"), upd.strftime("%A"), delta_color="off")
+    c[1].metric("Age of data", _age(age))
+    c[2].metric("Market", "OPEN" if is_open else "CLOSED", f"now {now.strftime('%d %b %H:%M:%S')}", delta_color="off")
+    if is_open and age > 3 * cfg.REFRESH_SECONDS:
+        st.error(f"Data is stale: last updated {_age(age)} while the market is open. "
+                 "The analysis engine may have stopped: reload the page" +
+                 (" or restart python -m tradesathi.main." if engine.external() else "."))
+    elif not is_open:
+        st.caption("Market closed: prices are from the last session (Mon-Fri 09:15-15:30 IST). "
+                   "Delayed free data, not investment advice.")
+    else:
+        st.caption("Delayed free data, not investment advice.")
+
+
+# ------------------------------------------------------------------ sidebar (names only)
+def go_to(page, sym=None):
+    st.session_state.page, st.session_state.sym = page, sym
+
+
+def nav(label, page, sym=None):
+    active = st.session_state.page == page and st.session_state.sym == sym
+    st.button(label, key=f"nav_{page}_{sym}", on_click=go_to, args=(page, sym),
+              type="primary" if active else "secondary", width="stretch")
+
+
+def sidebar(data):
+    with st.sidebar:
+        st.markdown("### Trading Analyzer")
+        now, is_open = market_state()
+        if data:
+            upd = dt.datetime.fromisoformat(data["updated"]).astimezone(IST)
+            st.caption(f"{'🟢 Market open' if is_open else '⚪ Market closed'} · updated {upd:%d %b %H:%M:%S}")
+        nav("📊 Overview", "overview")
+        if data:
+            held, wanted, _, ideas = split(data)
+            if held:
+                with st.expander(f"My holdings ({len(held)})", expanded=True):
+                    for s, m in held.items():
+                        nav(f"{'🟢' if (m['pnl'] or 0) >= 0 else '🔴'} {short(s)}  {m['pnl_pct']:+.1f}%", "share", s)
+            if wanted:
+                with st.expander(f"Want to buy ({len(wanted)})", expanded=True):
+                    for s, p in wanted.items():
+                        nav(f"{VERDICT_DOT.get(p['verdict'], '⚪')} {short(s)}  {p['verdict'].title()}", "share", s)
+            if ideas:
+                with st.expander(f"New ideas ({len(ideas)})", expanded=False):
+                    for r in ideas:
+                        nav(f"{short(r['symbol'])}  {r['action'][:18]}", "share", r["symbol"])
+        st.divider()
+        nav("📝 Paper trades", "paper")
+        nav("🧪 Historical check", "history")
+        nav("🛠 Manage lists", "manage")
+        nav("💡 New ideas table", "ideas")
+        st.caption(f"Your data is stored in: {persist.backend().name}")
+
+
+# ------------------------------------------------------------------ chart
+def price_chart(sym, r, held_row=None, want_row=None, height=520):
+    bars = resample(store.load(sym, "1m"), cfg.INTRA_RULE)
+    if bars.empty:
+        st.info(f"No intraday data stored for {sym} yet.")
+        return
+    bars = bars[bars.index >= bars.index[-1].normalize() - pd.Timedelta(days=3)]
+    b = add_all(bars, intraday=True)
+    fig = go.Figure(go.Candlestick(x=b.index, open=b.open, high=b.high, low=b.low, close=b.close, name=sym))
+    fig.add_trace(go.Scatter(x=b.index, y=b.vwap, name="VWAP", line=dict(width=1.2)))
+    fig.add_trace(go.Scatter(x=b.index, y=b.ema20, name="EMA20", line=dict(width=1.2)))
+    pat = detect(b)
+    for name, bias in BIAS.items():
+        if bias == 0:
+            continue
+        idx = pat.index[pat[name]]
+        y = b.loc[idx, "low"] * 0.998 if bias > 0 else b.loc[idx, "high"] * 1.002
+        fig.add_trace(go.Scatter(x=idx, y=y, mode="markers", name=name, hovertext=name,
+                                 marker=dict(symbol="triangle-up" if bias > 0 else "triangle-down", size=10)))
+    if held_row:   # you own it: show YOUR buy price, stop and targets
+        fig.add_hline(y=held_row["buy_price"], line_color="royalblue", annotation_text=f"Your buy {held_row['buy_price']}")
+        fig.add_hline(y=held_row["stop"], line_dash="dash", line_color="red", annotation_text=f"Stop ({held_row['stop_type']})")
+        for k in ("t1", "t2"):
+            if held_row[k]:
+                fig.add_hline(y=held_row[k], line_dash="dash", line_color="green", annotation_text=k.upper())
+    else:
+        fig.add_hrect(y0=r["entry_low"], y1=r["entry_high"], fillcolor="green", opacity=0.15, line_width=0,
+                      annotation_text="Entry zone")
+        fig.add_hline(y=r["stop"], line_dash="dash", line_color="red", annotation_text="Stop")
+        fig.add_hline(y=r["t1"], line_dash="dash", line_color="green", annotation_text="T1")
+        fig.add_hline(y=r["t2"], line_dash="dash", line_color="green", annotation_text="T2")
+    if want_row and want_row.get("limit"):
+        fig.add_hline(y=want_row["limit"], line_color="royalblue", annotation_text=f"Your limit buy {want_row['limit']}")
+    fig.add_hline(y=r["support"], line_dash="dot", line_color="gray", annotation_text="Support")
+    if r["resistance"]:
+        fig.add_hline(y=r["resistance"], line_dash="dot", line_color="gray", annotation_text="Resistance")
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[15.5, 9.25], pattern="hour")])
+    fig.update_layout(height=height, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig, width="stretch")
+
+
+def buy_hold_chart(symbols):
+    """Strategy CAGR vs simply buying and holding, from the historical check."""
+    hist = store.read_json("history.json") or {}
+    rows = []
+    for s in symbols:
+        st_ = (hist.get(s) or {}).get("stats") or {}
+        if st_.get("years") and (st_.get("cagr_pct") is not None or st_.get("buy_hold_cagr_pct") is not None):
+            rows.append((short(s), st_.get("cagr_pct"), st_.get("buy_hold_cagr_pct")))
+    if not rows:
+        st.info("No historical results yet for these shares (new listings need about a year of history).")
+        return
+    names, strat, bh = zip(*rows)
+    fig = go.Figure([go.Bar(x=names, y=strat, name="This strategy (CAGR %)"),
+                     go.Bar(x=names, y=bh, name="Buy & hold (CAGR %)")])
+    fig.update_layout(barmode="group", height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis_title="% per year")
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Each share's past results (about 5 years). Where the strategy bar is below buy & hold, simply holding "
+               "the share would have done better. Shares not listed have too little history to test.")
+
+
+# ------------------------------------------------------------------ pages
+def page_overview(data):
+    held, wanted, ok, _ = split(data)
+    status_bar(data["updated"])
+    problems = [f"{m['symbol']}: {m['error']}" for m in data.get("holdings", []) if "error" in m] + \
+               [f"{p['symbol']}: {p['error']}" for p in data.get("buylist", []) if "error" in p]
+    if problems:
+        with st.expander(f"Data problems ({len(problems)})"):
+            for t in problems:
+                st.error(t)
+    if held:
+        p = data["portfolio"]
+        c = st.columns(4)
+        c[0].metric("Invested", f"{p['invested']:,.0f}")
+        c[1].metric("Current value", f"{p['value']:,.0f}")
+        c[2].metric("P&L", f"{p['pnl']:,.0f}", f"{p['pnl_pct']}%")
+        c[3].metric("P&L if all stops hit", f"{p['pnl_at_stops']:,.0f}")
+    go_now = [s for s, p in wanted.items() if p["verdict"] == "BUY NOW" and p.get("confirmed", True)]
+    if go_now:
+        st.success("BUY signal now: " + ", ".join(go_now))
+
+    by_sym = {r["symbol"]: r for r in ok}
+    order = [s for s in list(held) + list(wanted) + [r["symbol"] for r in ok] if s in by_sym]
+    order = list(dict.fromkeys(order))                     # first holding first, then buy list, then the rest
+    if order:
+        sym = st.selectbox("Chart", order, key="ov_sym", format_func=short)
+        price_chart(sym, by_sym[sym], held.get(sym), wanted.get(sym))
+
+    t1, t2, t3 = st.tabs(["My holdings", "Want to buy", "Buy & hold vs strategy"])
+    with t1:
+        if held:
+            st.dataframe(pd.DataFrame([{"Symbol": short(s), "Qty": m["qty"], "Buy": m["buy_price"], "Price": m["price"],
+                                        "P&L %": m["pnl_pct"], "Action": m["action"], "Stop": m["stop"], "T1": m["t1"]}
+                                       for s, m in held.items()]), hide_index=True, width="stretch")
+            st.caption("Click a name in the left pane for the full detail of a share.")
+        else:
+            st.info("No holdings yet. Add them under Manage lists.")
+    with t2:
+        if wanted:
+            st.dataframe(pd.DataFrame([{"Symbol": short(s), "Price": p["price"], "Verdict": p["verdict"],
+                                        "Buy zone": f"{p['buy_zone_low']}-{p['buy_zone_high']}", "Limit": p["limit"],
+                                        "Stop": p["stop"], "History": hist_str(p.get("history"))}
+                                       for s, p in wanted.items()]), hide_index=True, width="stretch")
+            st.caption("WAIT rows show the buy zone it would use if the signal turns to BUY. "
+                       "Click a name in the left pane for the reason behind each verdict.")
+        else:
+            st.info("Nothing on your buy list. Add shares under Manage lists.")
+    with t3:
+        buy_hold_chart(list(held) + list(wanted))
+
+
+def page_share(data):
+    sym = st.session_state.sym
+    held, wanted, ok, _ = split(data)
+    r = next((x for x in ok if x["symbol"] == sym), None)
+    if sym is None or r is None:
+        st.info("That share is no longer in the data. Pick another from the left pane.")
+        return
+    m, p = held.get(sym), wanted.get(sym)
+    status_bar(data["updated"])
+    st.subheader(sym)
+    if m:
+        c = st.columns(5)
+        c[0].metric("Price", num(m["price"]))
+        c[1].metric("P&L", num(m["pnl"], "{:,.0f}"), f"{m['pnl_pct']}%")
+        c[2].metric("Qty x buy", f"{m['qty']:g} x {num(m['buy_price'])}")
+        c[3].metric(f"Stop ({m['stop_type']})", num(m["stop"]))
+        c[4].metric("Targets T1 / T2", f"{num(m['t1'])} / {num(m['t2'])}")
+        c = st.columns(3)
+        c[0].metric("Breakeven", num(m["breakeven"]))
+        c[1].metric("Money at risk", num(m["money_at_risk"], "{:,.0f}"))
+        c[2].metric("Action", m["action"])
+    if p:
+        getattr(st, p["level"])(f"**{short(sym)}: {p['verdict']}**\n\n{p['when']}")
+        c = st.columns(5)
+        c[0].metric("Price", num(p["price"]))
+        c[1].metric("Buy zone", f"{num(p['buy_zone_low'])}-{num(p['buy_zone_high'])}")
+        c[2].metric("Limit price", num(p["limit"]))
+        c[3].metric("Stop", num(p["stop"]))
+        c[4].metric("T1 / T2", f"{num(p['t1'])} / {num(p['t2'])}")
+        if p["qty"]:
+            c = st.columns(4)
+            c[0].metric("Qty", p["qty"])
+            c[1].metric("Cost", num(p["cost"], "{:,.0f}"))
+            c[2].metric("Max loss", num(p["max_loss"], "{:,.0f}"), f"{p['max_loss_pct']}% of cost", delta_color="off")
+            c[3].metric("Price must fall %", num(p["gap_pct"]) if p["verdict"] == "PLACE LIMIT ORDER" else "-")
+        if p["steps"]:
+            st.markdown("\n".join(f"- {s}" for s in p["steps"]))
+        for n in p["notes"]:
+            st.caption(n)
+    if not m and not p:
+        c = st.columns(5)
+        c[0].metric("Price", num(r["price"]))
+        c[1].metric("Action", r["action"])
+        c[2].metric("Score", r["score"])
+        c[3].metric("Entry zone", f"{num(r['entry_low'])}-{num(r['entry_high'])}")
+        c[4].metric("Stop / T1", f"{num(r['stop'])} / {num(r['t1'])}")
+
+    price_chart(sym, r, m, p, height=480)
+    tw, tp, th = st.tabs(["Why this score", "Candle patterns", "Historical check"])
+    with tw:
+        st.write("\n".join(f"- {w}" for w in r["why"]))
+    with tp:
+        st.write(", ".join(x["name"] for x in r["patterns"]) or "None in the latest candles")
+    with th:
+        s = ((store.read_json("history.json") or {}).get(sym) or {}).get("stats")
+        if not s:
+            st.info("No historical check stored for this share yet.")
+        elif s.get("edge") == NO_HISTORY:
+            st.warning(f"{NO_HISTORY}: {s.get('history_years', 0):.2f} years, {s.get('history_bars', 0)} daily bars. "
+                       "The rules cannot be tested yet.")
+        else:
+            c = st.columns(5)
+            c[0].metric("Verdict", s["edge"])
+            c[1].metric("Trades", s["trades"], f"win {s['win_rate']}%", delta_color="off")
+            c[2].metric("Expectancy (R)", f"{s['expectancy_r']:+.3f}", f"t-stat {s.get('t_stat') or 0:+.2f}", delta_color="off")
+            c[3].metric("Strategy vs buy & hold (CAGR)", f"{num(s['cagr_pct'], '{:.1f}')}% vs {num(s.get('buy_hold_cagr_pct'), '{:.1f}')}%")
+            c[4].metric("Max drawdown", f"{s['max_dd_pct']}%")
+
+
+def page_ideas(data):
+    _, _, _, ideas = split(data)
+    for r in data["results"]:
+        if "error" in r and r["symbol"] not in data.get("held", []) and r["symbol"] not in data.get("wanted", []):
+            st.error(f"{r['symbol']}: {r['error']}")
+    if not ideas:
+        st.info("No new ideas right now.")
+        return
+    st.dataframe(pd.DataFrame([{
+        "Symbol": short(r["symbol"]), "Price": r["price"], "Action": r["action"], "Score": r["score"],
+        "Entry low": r["entry_low"], "Entry high": r["entry_high"], "Stop": r["stop"], "T1": r["t1"], "T2": r["t2"],
+        "Support": r["support"], "Resistance": r["resistance"], "RSI": r["rsi"], "History": hist_str(r.get("history"))}
+        for r in ideas]), hide_index=True, width="stretch")
+    pl = data["plan"]
+    s = pl["summary"]
+    c = st.columns(4)
+    c[0].metric("Free capital", f"{s['capital']:,.0f}")
+    c[1].metric("New buys", f"{s['invested']:,.0f}")
+    c[2].metric("Cash left", f"{s['cash_left']:,.0f}")
+    c[3].metric("Worst-case loss", f"{s['worst_case_loss']:,.0f}", f"-{s['worst_case_pct']}%", delta_color="inverse")
+    if pl["positions"]:
+        st.dataframe(pd.DataFrame(pl["positions"]), hide_index=True, width="stretch")
+    else:
+        st.info("No valid BUY setups right now, so no new capital is allocated.")
+
+
+def page_paper(data):
+    ps = data.get("paper")
+    if not ps:
+        st.info("No paper trades yet.")
+        return
+    a, g = ps["all"], ps["allowed"]
+    c = st.columns(4)
+    c[0].metric("Open", ps["open"])
+    c[1].metric("Closed trades", a["trades"], f"win {a['win_rate']}%")
+    c[2].metric("Expectancy (R)", f"{a['expectancy_r']:+.3f}", f"t-stat {a['t_stat']:+.2f}")
+    c[3].metric("Allowed by history gate", g["trades"], f"{g['expectancy_r']:+.3f}R")
+    pt = paper.load(store)
+    if len(pt):
+        st.dataframe(pt[["symbol", "opened", "entry", "stop", "t1", "t2", "gated", "edge", "status", "t1_hit",
+                         "exit_time", "exit_price", "reason", "r"]].iloc[::-1], hide_index=True, width="stretch")
+    st.caption("Every live BUY NOW is followed automatically, no real orders. Judge it only after 50+ closed trades: "
+               "expectancy above 0 with a t-stat of 2 or more.")
+
+
+def page_history(data):
+    hist = store.read_json("history.json")
+    if not hist:
+        st.info("No historical check yet.")
+        return
+    st.dataframe(pd.DataFrame([{
+        "Symbol": short(k), "Verdict": v["stats"]["edge"], "Test": v["stats"].get("method") or "-",
+        "Trades": v["stats"]["trades"], "Win %": v["stats"]["win_rate"], "Avg win (R)": v["stats"]["avg_win_r"],
+        "Avg loss (R)": v["stats"]["avg_loss_r"], "Expectancy (R)": v["stats"]["expectancy_r"],
+        "t-stat": v["stats"].get("t_stat"), "Profit factor": v["stats"]["profit_factor"],
+        "Max drawdown %": v["stats"]["max_dd_pct"], "Strategy CAGR %": v["stats"]["cagr_pct"],
+        "Buy&hold CAGR %": v["stats"].get("buy_hold_cagr_pct"), "Years": v["stats"]["years"],
+        "As of": v["asof"]} for k, v in hist.items()]), hide_index=True, width="stretch")
+    st.caption("Same rules replayed on past candles. Expectancy (R) = average profit per trade in units of the amount "
+               f"risked, after estimated charges. Only verdicts in {', '.join(cfg.ALLOWED_EDGES)} may BUY "
+               f"(EDGE needs a t-stat of {cfg.EDGE_MIN_TSTAT:g}+, i.e. unlikely to be luck).")
+
+
+# ---- list editing: outside the auto-refreshing part so edits are not lost ----
 def manage(key, module, columns, add_fields, ready):
     """Add form + editable table with a Delete tick-box. `ready(row)` says whether a new row is complete."""
     with st.form(f"{key}_add", clear_on_submit=True):
@@ -83,7 +442,8 @@ def manage(key, module, columns, add_fields, ready):
         st.rerun()
 
 
-with st.expander("My holdings (shares I already bought): add, edit or delete"):
+def page_manage():
+    st.subheader("My holdings (shares I already bought)")
     st.caption("Add a purchase with the form, edit cells directly, or pick rows and click Delete. Several rows for the "
                "same share are merged at the average price. The engine picks up changes within a minute.")
     manage("hold", hd, {
@@ -92,8 +452,8 @@ with st.expander("My holdings (shares I already bought): add, edit or delete"):
         "buy_price": st.column_config.NumberColumn("Buy price", min_value=0.01, format="%.2f"),
     }, [("symbol", "Symbol", "text"), ("qty", "Quantity", "num"), ("buy_price", "Buy price", "num")],
         lambda r: r["qty"] and r["buy_price"])
-
-with st.expander("Shares I want to BUY: add, edit or delete"):
+    st.divider()
+    st.subheader("Shares I want to BUY")
     st.caption("Fill Amount (rupees to invest) OR Quantity. Max price is optional: the most you will pay per share. "
                "The engine tells you when and at what price to buy, within a minute of saving.")
     manage("buy", bl, {
@@ -106,10 +466,15 @@ with st.expander("Shares I want to BUY: add, edit or delete"):
         lambda r: r["amount"] or r["qty"])
 
 
+# ------------------------------------------------------------------ main
+PAGES = {"overview": page_overview, "share": page_share, "ideas": page_ideas, "paper": page_paper,
+         "history": page_history}
+
+
 @st.fragment(run_every="30s")
-def view():
-    path = os.path.join(cfg.DATA_DIR, "signals.json")
-    if not os.path.exists(path):
+def content():
+    data = load_data()
+    if data is None:
         if engine.external():
             st.warning("No data yet. Start the engine first: python -m tradesathi.main")
         elif engine.STATE["last_error"]:
@@ -118,167 +483,15 @@ def view():
             st.info("The engine is starting: the first run downloads price history and can take a few minutes. "
                     "This page refreshes by itself.")
         return
-    data = json.load(open(path))
-    st.caption(f"Last update: {data['updated'][:19]} IST  |  Delayed free data, not investment advice")
-    held_rows = {m["symbol"]: m for m in data.get("holdings", []) if "error" not in m}
-    wanted_rows = {p["symbol"]: p for p in data.get("buylist", []) if "error" not in p}
-
-    # ---------------- my holdings ----------------
-    if data.get("holdings"):
-        st.subheader("My holdings")
-        for m in data["holdings"]:
-            if "error" in m:
-                st.error(f"{m['symbol']}: {m['error']}")
-        p = data["portfolio"]
-        c = st.columns(4)
-        c[0].metric("Invested", f"{p['invested']:,.0f}")
-        c[1].metric("Current value", f"{p['value']:,.0f}")
-        c[2].metric("P&L", f"{p['pnl']:,.0f}", f"{p['pnl_pct']}%")
-        c[3].metric("P&L if all stops hit", f"{p['pnl_at_stops']:,.0f}")
-        if held_rows:
-            st.dataframe(pd.DataFrame([{
-                "Symbol": m["symbol"], "Qty": m["qty"], "Buy": m["buy_price"], "Price": m["price"],
-                "P&L": m["pnl"], "P&L %": m["pnl_pct"], "Action": m["action"],
-                "Stop": m["stop"], "Stop type": m["stop_type"], "T1": m["t1"], "T2": m["t2"],
-                "Breakeven": m["breakeven"], "Money at risk": m["money_at_risk"], "History": hist_str(m.get("history"))} for m in held_rows.values()]),
-                hide_index=True, width="stretch")
-            for m in held_rows.values():
-                for w in m["why"]:
-                    st.caption(f"{m['symbol']}: {w}")
-
-    # ---------------- shares I want to buy: when to buy ----------------
-    if data.get("buylist"):
-        st.subheader("Shares I want to buy: when to buy")
-        for p in data["buylist"]:
-            if "error" in p:
-                st.error(f"{p['symbol']}: {p['error']}")
-        if wanted_rows:
-            go_now = [s for s, p in wanted_rows.items() if p["verdict"] == "BUY NOW" and p.get("confirmed", True)]
-            if go_now:
-                st.success("BUY signal now: " + ", ".join(go_now))
-            st.dataframe(pd.DataFrame([{
-                "Symbol": p["symbol"], "Price": p["price"], "Verdict": p["verdict"],
-                "Buy zone": f"{p['buy_zone_low']}-{p['buy_zone_high']}", "Limit price": p["limit"],
-                "Price must fall %": p["gap_pct"] if p["verdict"] == "PLACE LIMIT ORDER" else None,
-                "Stop": p["stop"], "T1": p["t1"], "T2": p["t2"], "Qty": p["qty"], "Cost": p["cost"],
-                "Max loss": p["max_loss"], "Max loss % of cost": p["max_loss_pct"],
-                "History": hist_str(p.get("history"))} for p in wanted_rows.values()]),
-                hide_index=True, width="stretch")
-            for p in wanted_rows.values():
-                getattr(st, p["level"])(f"**{p['symbol']}: {p['verdict']}**\n\n{p['when']}")
-                if p["steps"]:
-                    st.markdown("\n".join(f"- {s}" for s in p["steps"]))
-                for n in p["notes"]:
-                    st.caption(f"{p['symbol']}: {n}")
-            st.caption("WAIT rows show the buy zone it would use if the signal turns to BUY. "
-                       "A limit order is good for a few trading days; re-check after that.")
-
-    # ---------------- new ideas ----------------
-    ok = [r for r in data["results"] if "error" not in r]
-    for r in data["results"]:
-        if "error" in r and r["symbol"] not in held_rows and r["symbol"] not in data.get("wanted", []):
-            st.error(f"{r['symbol']}: {r['error']}")
-    ideas = [r for r in ok if r["symbol"] not in data.get("held", []) and r["symbol"] not in data.get("wanted", [])]
-    if ideas:
-        st.subheader("New ideas")
-        st.dataframe(pd.DataFrame([{
-            "Symbol": r["symbol"], "Price": r["price"], "Action": r["action"], "Score": r["score"],
-            "Entry low": r["entry_low"], "Entry high": r["entry_high"], "Stop": r["stop"],
-            "T1": r["t1"], "T2": r["t2"], "Support": r["support"], "Resistance": r["resistance"],
-            "RSI": r["rsi"], "History": hist_str(r.get("history"))} for r in ideas]), hide_index=True, width="stretch")
-        pl = data["plan"]
-        s = pl["summary"]
-        c = st.columns(4)
-        c[0].metric("Free capital", f"{s['capital']:,.0f}")
-        c[1].metric("New buys", f"{s['invested']:,.0f}")
-        c[2].metric("Cash left", f"{s['cash_left']:,.0f}")
-        c[3].metric("Worst-case loss", f"{s['worst_case_loss']:,.0f}", f"-{s['worst_case_pct']}%", delta_color="inverse")
-        if pl["positions"]:
-            st.dataframe(pd.DataFrame(pl["positions"]), hide_index=True, width="stretch")
-        else:
-            st.info("No valid BUY setups right now, so no new capital is allocated.")
-
-    ps = data.get("paper")
-    if ps:
-        st.subheader("Paper trades (every live BUY NOW followed automatically, no real orders)")
-        a, g = ps["all"], ps["allowed"]
-        c = st.columns(4)
-        c[0].metric("Open", ps["open"])
-        c[1].metric("Closed trades", a["trades"], f"win {a['win_rate']}%")
-        c[2].metric("Expectancy (R)", f"{a['expectancy_r']:+.3f}", f"t-stat {a['t_stat']:+.2f}")
-        c[3].metric("Allowed by history gate", g["trades"], f"{g['expectancy_r']:+.3f}R")
-        pt = paper.load(store)
-        if len(pt):
-            st.dataframe(pt[["symbol", "opened", "entry", "stop", "t1", "t2", "gated", "edge", "status", "t1_hit",
-                             "exit_time", "exit_price", "reason", "r"]].iloc[::-1], hide_index=True, width="stretch")
-        st.caption("This is the real test of the live signal. Judge it only after 50+ closed trades: "
-                   "expectancy above 0 with a t-stat of 2 or more.")
-
-    hist = store.read_json("history.json")
-    if hist:
-        st.subheader("Historical check (same rules replayed on past candles)")
-        st.dataframe(pd.DataFrame([{
-            "Symbol": k, "Verdict": v["stats"]["edge"], "Test": v["stats"].get("method", "daily"),
-            "Trades": v["stats"]["trades"], "Win %": v["stats"]["win_rate"], "Avg win (R)": v["stats"]["avg_win_r"],
-            "Avg loss (R)": v["stats"]["avg_loss_r"], "Expectancy (R)": v["stats"]["expectancy_r"],
-            "t-stat": v["stats"].get("t_stat"), "Profit factor": v["stats"]["profit_factor"],
-            "Max drawdown %": v["stats"]["max_dd_pct"], "Strategy CAGR %": v["stats"]["cagr_pct"],
-            "Buy&hold CAGR %": v["stats"].get("buy_hold_cagr_pct"), "Years": v["stats"]["years"],
-            "As of": v["asof"]} for k, v in hist.items()]),
-            hide_index=True, width="stretch")
-        st.caption("Expectancy (R) = average profit per trade in units of the amount risked, after estimated charges. "
-                   f"Only verdicts in {', '.join(cfg.ALLOWED_EDGES)} may BUY (EDGE needs a t-stat of "
-                   f"{cfg.EDGE_MIN_TSTAT:g}+, i.e. unlikely to be luck).")
-
-    if not ok:
-        return
-    sym = st.selectbox("Chart", [r["symbol"] for r in ok])
-    r = next(x for x in ok if x["symbol"] == sym)
-    m = held_rows.get(sym)
-    bars = resample(store.load(sym, "1m"), cfg.INTRA_RULE)
-    bars = bars[bars.index >= bars.index[-1].normalize() - pd.Timedelta(days=3)]
-    b = add_all(bars, intraday=True)
-
-    fig = go.Figure(go.Candlestick(x=b.index, open=b.open, high=b.high, low=b.low, close=b.close, name=sym))
-    fig.add_trace(go.Scatter(x=b.index, y=b.vwap, name="VWAP", line=dict(width=1.2)))
-    fig.add_trace(go.Scatter(x=b.index, y=b.ema20, name="EMA20", line=dict(width=1.2)))
-    pat = detect(b)
-    for name, bias in BIAS.items():
-        if bias == 0:
-            continue
-        idx = pat.index[pat[name]]
-        y = b.loc[idx, "low"] * 0.998 if bias > 0 else b.loc[idx, "high"] * 1.002
-        fig.add_trace(go.Scatter(x=idx, y=y, mode="markers", name=name, hovertext=name,
-                                 marker=dict(symbol="triangle-up" if bias > 0 else "triangle-down", size=10)))
-    if m:   # you own it: show YOUR buy price, stop and targets
-        fig.add_hline(y=m["buy_price"], line_color="royalblue", annotation_text=f"Your buy {m['buy_price']}")
-        fig.add_hline(y=m["stop"], line_dash="dash", line_color="red", annotation_text=f"Stop ({m['stop_type']})")
-        for k in ("t1", "t2"):
-            if m[k]:
-                fig.add_hline(y=m[k], line_dash="dash", line_color="green", annotation_text=k.upper())
-    else:
-        fig.add_hrect(y0=r["entry_low"], y1=r["entry_high"], fillcolor="green", opacity=0.15, line_width=0,
-                      annotation_text="Entry zone")
-        fig.add_hline(y=r["stop"], line_dash="dash", line_color="red", annotation_text="Stop")
-        fig.add_hline(y=r["t1"], line_dash="dash", line_color="green", annotation_text="T1")
-        fig.add_hline(y=r["t2"], line_dash="dash", line_color="green", annotation_text="T2")
-    wp = wanted_rows.get(sym)
-    if wp and wp.get("limit"):
-        fig.add_hline(y=wp["limit"], line_color="royalblue", annotation_text=f"Your limit buy {wp['limit']}")
-    fig.add_hline(y=r["support"], line_dash="dot", line_color="gray", annotation_text="Support")
-    if r["resistance"]:
-        fig.add_hline(y=r["resistance"], line_dash="dot", line_color="gray", annotation_text="Resistance")
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[15.5, 9.25], pattern="hour")])
-    fig.update_layout(height=650, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig, width="stretch")
-
-    left, right = st.columns(2)
-    with left:
-        st.markdown("**Why this score**")
-        st.write("\n".join(f"- {w}" for w in r["why"]))
-    with right:
-        st.markdown("**Candle patterns detected**")
-        st.write(", ".join(p["name"] for p in r["patterns"]) or "None in the latest candles")
+    if data["updated"] != st.session_state.get("sb_ts"):
+        st.rerun()                                      # new engine cycle: rebuild the left pane too
+    PAGES[st.session_state.page](data)
 
 
-view()
+_data = load_data()
+sidebar(_data)
+st.session_state.sb_ts = _data["updated"] if _data else None
+if st.session_state.page == "manage":
+    page_manage()
+else:
+    content()

@@ -16,7 +16,8 @@ def test_dashboard_renders_with_data(workdir, fake_source):
     engine.cycle(fake_source, Store(), 0)
     at = AppTest.from_file(DASH, default_timeout=60).run()
     assert not at.exception, at.exception
-    assert any("My holdings" in s.value for s in at.subheader)
+    assert any(m.label == "Invested" for m in at.metric)                # overview: portfolio summary
+    assert any("TCS" in b.label for b in at.sidebar.button)             # left pane lists the holding by name
 
 
 def test_dashboard_before_first_cycle(workdir):

@@ -3,12 +3,13 @@ from tradesathi import config as cfg
 from tradesathi.analysis import backtest
 
 KEYS = ("edge", "trades", "win_rate", "expectancy_r", "profit_factor", "max_dd_pct", "cagr_pct",
-        "buy_hold_cagr_pct", "years", "avg_win_r", "avg_loss_r", "t_stat", "method")
+        "buy_hold_cagr_pct", "years", "avg_win_r", "avg_loss_r", "t_stat", "method", "history_bars", "history_years")
+NO_HISTORY = "NOT ENOUGH HISTORY"       # share too new to be tested (not the same as "tested, found nothing")
 
 
 def _settings():
     """Cached results are thrown away when any of these change."""
-    return [cfg.BACKTEST_YEARS, cfg.HISTORY_TEST, cfg.CHARGES_PCT, cfg.BUY_SCORE, cfg.MIN_TRADES, cfg.EDGE_MIN_TSTAT]
+    return [cfg.BACKTEST_YEARS, cfg.HISTORY_TEST, cfg.CHARGES_PCT, cfg.BUY_SCORE, cfg.MIN_TRADES, cfg.EDGE_MIN_TSTAT, "v2"]   # "v2": NOT ENOUGH HISTORY label
 
 
 def stats_for(src, store, sym, now):
@@ -29,6 +30,11 @@ def stats_for(src, store, sym, now):
                 stats = backtest.intraday_run(m5, d, cfg.BACKTEST_YEARS)["metrics"]
         if stats is None:
             stats = backtest.run(d, cfg.BACKTEST_YEARS)["metrics"]
+        if not stats.get("trades") and not stats.get("years"):
+            # no test could run at all (newly listed share): say so, instead of "0 trades over 0 years"
+            stats["edge"] = NO_HISTORY
+            stats["history_bars"] = len(d)
+            stats["history_years"] = round((d.index[-1] - d.index[0]).days / 365.25, 2) if len(d) else 0.0
         cache[sym] = {"asof": now.date().isoformat(), "settings": _settings(), "stats": stats}
         store.write_json("history.json", cache)
         return stats
@@ -40,6 +46,8 @@ def stats_for(src, store, sym, now):
 def hist_str(h):
     if not h:
         return "-"
+    if h["edge"] == NO_HISTORY:
+        return f"{NO_HISTORY} ({h.get('history_years') or 0:.2f}y, untested)"
     return f"{h['edge']} n={h['trades']} win {h['win_rate']:.0f}% E={h['expectancy_r']:+.2f}R t={h.get('t_stat') or 0:+.1f}"
 
 
@@ -48,8 +56,11 @@ def apply(res, stats):
     res["action_before_gate"] = res["action"]
     if stats:
         res["history"] = {k: stats.get(k) for k in KEYS}
-        res["why"].append(f"History ({stats['years']}y, {stats.get('method', 'daily')}): {hist_str(res['history'])}, "
-                          f"max drawdown {stats['max_dd_pct']}%")
+        if stats["edge"] == NO_HISTORY:
+            res["why"].append(f"History: {hist_str(res['history'])}")
+        else:
+            res["why"].append(f"History ({stats['years']}y, {stats.get('method', 'daily')}): {hist_str(res['history'])}, "
+                              f"max drawdown {stats['max_dd_pct']}%")
     edge = stats["edge"] if stats else None                 # no record at all = not proven either
     if cfg.REQUIRE_HISTORICAL_EDGE and res["signal"] == "BUY" and edge not in cfg.ALLOWED_EDGES:
         res["valid"] = False

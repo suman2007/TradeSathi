@@ -6,6 +6,9 @@ from tradesathi.analysis.indicators import add_all
 from tradesathi.analysis.patterns import latest
 
 
+TF = f"{int(pd.Timedelta(cfg.INTRA_RULE).total_seconds() // 60)}m"    # label for the intraday candle size, e.g. "3m"
+
+
 def resample(m1, rule=cfg.INTRA_RULE, now=None):
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     bars = m1.resample(rule).agg(agg).dropna(subset=["close"])
@@ -72,8 +75,8 @@ def analyze(symbol, daily, m1, now):
         check(dl.close > dl.ema200, "Daily close above EMA200", "Daily close below EMA200")
     # --- intraday momentum ---
     check(price > x.vwap, "Price above VWAP", "Price below VWAP")
-    check(x.ema20 > x.ema50, "5m EMA20 above EMA50", "5m EMA20 below EMA50")
-    check(x.macd_hist > 0, "5m MACD histogram positive", "5m MACD histogram negative")
+    check(x.ema20 > x.ema50, f"{TF} EMA20 above EMA50", f"{TF} EMA20 below EMA50")
+    check(x.macd_hist > 0, f"{TF} MACD histogram positive", f"{TF} MACD histogram negative")
     if 45 <= x.rsi <= 70:
         add(1, f"RSI healthy ({x.rsi:.0f})")
     elif x.rsi > 75:
@@ -85,7 +88,7 @@ def analyze(symbol, daily, m1, now):
         add(1 if x.close >= x.open else -1, "Volume spike on " + ("green" if x.close >= x.open else "red") + " candle")
     # --- candlestick patterns (intraday and daily) ---
     pats_i, pats_d = latest(b, 2), latest(d, 1)
-    for tag, pats in (("5m", pats_i), ("daily", pats_d)):
+    for tag, pats in ((TF, pats_i), ("daily", pats_d)):
         net = max(-1, min(1, sum(p["bias"] for p in pats)))
         if net:
             add(net, f"{tag} pattern: " + ", ".join(p["name"] for p in pats if p["bias"]))

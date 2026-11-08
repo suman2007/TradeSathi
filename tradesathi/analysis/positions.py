@@ -2,7 +2,7 @@
 from tradesathi import config as cfg
 
 
-def manage(res, qty, buy, prev=None):
+def manage(res, qty, buy, prev=None, days_held=None):
     """res = strategy.analyze() output for the symbol. prev = what we stored last cycle: {"stop", "r"}
     (an older plain number is read as the stop). Stops only move up; 1R is fixed the first time the holding is seen,
     so targets do not drift as volatility changes."""
@@ -46,6 +46,9 @@ def manage(res, qty, buy, prev=None):
     sig, profit = res["signal"], price > buy
     if price <= stop:                           # same rule as the backtest and the buy plan: a touch of the stop exits
         action = "EXIT NOW (stop hit)"
+    elif days_held is not None and days_held >= cfg.BT_MAX_HOLD:   # the history check closes every trade at this age
+        action = f"EXIT NOW (time limit: held {days_held} trading days)"
+        why.append(f"Held {days_held} trading days: past the {cfg.BT_MAX_HOLD}-day limit the strategy was tested with")
     elif sig == "AVOID":
         action = "EXIT / REDUCE (trend weak)"
         if not profit:
@@ -68,7 +71,7 @@ def manage(res, qty, buy, prev=None):
         "pnl": round(value - invested, 2), "pnl_pct": round((price / buy - 1) * 100, 2),
         "breakeven": round(breakeven, 2), "mode": mode, "action": action,
         "signal": sig, "score": res["score"],
-        "stop": round(stop, 2), "stop_type": kind, "r": round(R, 4),
+        "stop": round(stop, 2), "stop_type": kind, "r": round(R, 4), "days_held": days_held,
         "t1": round(t1, 2) if t1 else None, "t2": round(t2, 2) if t2 else None,
         "support": support, "resistance": resistance,
         "money_at_risk": round(max(0.0, qty * (price - stop)), 2),

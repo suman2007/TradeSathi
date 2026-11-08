@@ -3,6 +3,7 @@ Pure rules on top of strategy.analyze() (plus the historical edge gate). No pred
 import math
 
 from tradesathi import config as cfg
+from tradesathi.analysis.history import NO_HISTORY
 
 BUY_NOW, LIMIT, WAIT, NO = "BUY NOW", "PLACE LIMIT ORDER", "WAIT", "DO NOT BUY"
 LEVEL = {BUY_NOW: "success", LIMIT: "info", WAIT: "warning", NO: "error"}   # Streamlit box colour
@@ -21,6 +22,10 @@ def _history_reason(h):
     """Why the historical check does not back this BUY."""
     if not h:
         return "there is no historical record for this share to check the rules against."
+    if h["edge"] == NO_HISTORY:
+        return (f"this share has only {h.get('history_years') or 0:.2f} years ({h.get('history_bars') or 0} daily bars) "
+                f"of price history. The rules need at least {cfg.MIN_INTRADAY_YEARS:g} year of 5-minute history, or 260 "
+                f"daily bars, to be tested, so they could not be checked. This is not a failed test: re-check once it has more history.")
     yrs, n, e, t = h["years"], h["trades"], h["expectancy_r"], h.get("t_stat") or 0
     if h["edge"] == "INSUFFICIENT DATA":
         return f"over the last {yrs:g} years the rules gave only {n} trades here, too few to judge (needs {cfg.MIN_TRADES})."
@@ -65,11 +70,29 @@ def make(res, amount=None, qty=None, max_price=None):
 
     # ---------------- 1. verdict from the analysis ----------------
     if res["action"].startswith("SKIP (no proven"):
-        return _not_actionable(res, NO, "Do not buy. The signal says BUY, but " + _history_reason(hist), amount, max_price)
+        unproven = bool(hist) and hist["edge"] == NO_HISTORY
+        before = res.get("action_before_gate", "")
+        also = ""
+        if before.startswith("SKIP (resistance"):
+            also = (f" Also, before the history check: resistance at {resistance} is too close to the buy zone "
+                    f"(less than {cfg.MIN_RR}R of room).")
+        elif before.startswith(("WAIT", "BUY NOW")):
+            also = f" Before the history check the setup was: {before}."
+        if unproven:
+            return _not_actionable(res, WAIT, "Unverified. The signal says BUY, but " + _history_reason(hist) + also,
+                                   amount, max_price)
+        return _not_actionable(res, NO, "Do not buy. The signal says BUY, but " + _history_reason(hist) + also,
+                               amount, max_price)
     if sig == "AVOID":
         return _not_actionable(res, NO, (
             f"Do not buy now. The trend is weak (score {score:g}). Against you: {'; '.join(weak)}. "
             f"A score of {cfg.BUY_SCORE} or more is needed before this becomes a buy."), amount, max_price)
+    if (cfg.REQUIRE_HISTORICAL_EDGE and hist and hist["edge"] != NO_HISTORY and hist["edge"] not in cfg.ALLOWED_EDGES):
+        # the gate in history.apply() only runs on BUY signals, so without this a share that can never pass it
+        # would show WAIT forever and look as if a buy is coming
+        return _not_actionable(res, NO, (
+            f"Do not buy. Even if the signal turns to BUY (now {sig}, score {score:g}), it would be blocked: "
+            + _history_reason(hist)), amount, max_price)
     if sig == "WAIT":
         return _not_actionable(res, WAIT, (
             f"Not yet. Score is {score:g} and needs {cfg.BUY_SCORE} or more. Still against you: "
@@ -144,6 +167,8 @@ def make(res, amount=None, qty=None, max_price=None):
         steps.append(f"Stop-loss {stop:.2f}: place a stop-loss order right after buying; it sells everything "
                      f"if price trades down to {stop:.2f}")
         steps.append(f"Sell half at T1 {t1:.2f} and move your stop to your cost price; sell the rest at T2 {t2:.2f}")
+        steps.append(f"Time limit: if neither T2 nor the stop has been hit {cfg.BT_MAX_HOLD} trading days after you buy, "
+                     f"sell everything at market (the history check assumes this exit)")
         if verdict == LIMIT:
             steps.append(f"Order is good for {cfg.BT_MAX_WAIT} trading days. If it has not filled, cancel and re-check. "
                          f"Also cancel it if price closes below {stop:.2f}.")
