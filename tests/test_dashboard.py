@@ -14,14 +14,18 @@ DASH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 def test_dashboard_renders_with_data(workdir, fake_source):
     hd.save(pd.DataFrame([{"symbol": "TCS", "qty": 10, "buy_price": 900.0}]))
     engine.cycle(fake_source, Store(), 0)
-    at = AppTest.from_file(DASH, default_timeout=60).run()
+    at = AppTest.from_file(DASH, default_timeout=60)
+    at.session_state["sebi_ack"] = True
+    at.run()
     assert not at.exception, at.exception
     assert any(m.label == "Invested" for m in at.metric)                # overview: portfolio summary
     assert any("TCS" in b.label for b in at.sidebar.button)             # left pane lists the holding by name
 
 
 def test_dashboard_before_first_cycle(workdir):
-    at = AppTest.from_file(DASH, default_timeout=60).run()
+    at = AppTest.from_file(DASH, default_timeout=60)
+    at.session_state["sebi_ack"] = True
+    at.run()
     assert not at.exception, at.exception
 
 
@@ -36,3 +40,10 @@ def test_password_gate(workdir):
     assert at.error
     at.text_input[0].input("s3cret").run()
     assert not at.exception and "authed" in at.session_state
+
+
+def test_sebi_gate_blocks_until_accepted(workdir):
+    at = AppTest.from_file(DASH, default_timeout=60).run()
+    assert not at.exception, at.exception
+    assert not at.sidebar.button                                        # nothing usable behind the notice
+    assert "sebi_ack" not in at.session_state                           # still locked until the user accepts
