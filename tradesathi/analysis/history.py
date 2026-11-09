@@ -25,7 +25,7 @@ def stats_for(src, store, sym, now):
         stats = None
         if cfg.HISTORY_TEST == "intraday":
             m5 = backtest.ensure_5m(src, store, sym, now)
-            m5 = m5[m5.index.date < now.date()]
+            m5 = m5[m5.index.date < now.date()] if len(m5) else m5      # no 5-min data at all: use the daily test
             if len(m5) and (m5.index[-1] - m5.index[0]).days / 365.25 >= cfg.MIN_INTRADAY_YEARS:
                 stats = backtest.intraday_run(m5, d, cfg.BACKTEST_YEARS)["metrics"]
         if stats is None:

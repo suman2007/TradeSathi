@@ -27,6 +27,24 @@ INTRA_RULE = "5min"      # candle size for live intraday analysis. Keep it equal
                          # long history available): a different size means the EDGE verdicts describe other rules than the live ones
 REFRESH_SECONDS = 60
 
+# Normal session is Mon-Fri 09:15-15:30 IST. Add special days here as "YYYY-MM-DD": ("HH:MM", "HH:MM"),
+# e.g. Diwali Muhurat trading (usually a weekend/holiday). Use None to mark a full exchange holiday.
+SPECIAL_SESSIONS = {
+    "2026-11-08": ("14:20", "15:30"),   # Diwali Muhurat trading
+}
+
+
+def market_open(now):
+    """True if the exchange is open at `now` (IST-aware datetime), honouring SPECIAL_SESSIONS."""
+    import datetime as _dt
+    sp = SPECIAL_SESSIONS.get(now.date().isoformat(), "normal")
+    if sp is None:
+        return False
+    if sp == "normal":
+        return now.weekday() < 5 and _dt.time(9, 15) <= now.time() <= _dt.time(15, 30)
+    start, end = (_dt.time.fromisoformat(x) for x in sp)
+    return start <= now.time() <= end
+
 # --- historical validation (backtest on DAILY candles) ---
 HISTORY_PERIOD = "10y"          # how much daily history to download (5y test + warm-up for EMA200)
 BACKTEST_YEARS = 5              # years of signals to test (use --years 8 etc. in tradesathi/analysis/backtest.py)

@@ -50,7 +50,9 @@ def test_time_limit_exit_for_holdings():
 def test_first_seen_date_is_stored_and_kept(workdir, fake_source):
     hd.save(pd.DataFrame([{"symbol": "TCS", "qty": 10, "buy_price": 900.0}]))
     engine.cycle(fake_source, Store(), 0)
-    first = persist.read_text("data/stops.json")
-    assert '"since"' in first
+    import json
+    since = lambda: {k: v["since"] for k, v in json.loads(persist.read_text("data/stops.json")).items()}
+    first = since()
+    assert first and all(first.values())
     engine.cycle(fake_source, Store(), 1, force=True)
-    assert persist.read_text("data/stops.json") == first        # same date kept on later cycles
+    assert since() == first        # same first-seen date kept on later cycles (the stop itself may move up)

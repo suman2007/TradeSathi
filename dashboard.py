@@ -96,7 +96,7 @@ def _age(sec):
 
 def market_state():
     now = dt.datetime.now(IST)
-    return now, now.weekday() < 5 and dt.time(9, 15) <= now.time() <= dt.time(15, 30)
+    return now, cfg.market_open(now)
 
 
 def status_bar(updated_iso):
@@ -113,7 +113,7 @@ def status_bar(updated_iso):
                  "The analysis engine may have stopped: reload the page" +
                  (" or restart python -m tradesathi.main." if engine.external() else "."))
     elif not is_open:
-        st.caption("Market closed: prices are from the last session (Mon-Fri 09:15-15:30 IST). "
+        st.caption("Market closed: prices are from the last session (Mon-Fri 09:15-15:30 IST, plus special sessions in config). "
                    "Delayed free data, not investment advice.")
     else:
         st.caption("Delayed free data, not investment advice.")
@@ -124,9 +124,9 @@ def go_to(page, sym=None):
     st.session_state.page, st.session_state.sym = page, sym
 
 
-def nav(label, page, sym=None):
+def nav(label, page, sym=None, scope=""):
     active = st.session_state.page == page and st.session_state.sym == sym
-    st.button(label, key=f"nav_{page}_{sym}", on_click=go_to, args=(page, sym),
+    st.button(label, key=f"nav_{scope}_{page}_{sym}", on_click=go_to, args=(page, sym),
               type="primary" if active else "secondary", width="stretch")
 
 
@@ -144,15 +144,15 @@ def sidebar(data):
             if held:
                 with st.expander(f"My holdings ({len(held)})", expanded=True):
                     for s, m in held.items():
-                        nav(f"{'🟢' if (m['pnl'] or 0) >= 0 else '🔴'} {short(s)}  {m['pnl_pct']:+.1f}%", "share", s)
+                        nav(f"{'🟢' if (m['pnl'] or 0) >= 0 else '🔴'} {short(s)}  {m['pnl_pct']:+.1f}%", "share", s, "held")
             if wanted:
                 with st.expander(f"Want to buy ({len(wanted)})", expanded=True):
                     for s, p in wanted.items():
-                        nav(f"{VERDICT_DOT.get(p['verdict'], '⚪')} {short(s)}  {p['verdict'].title()}", "share", s)
+                        nav(f"{VERDICT_DOT.get(p['verdict'], '⚪')} {short(s)}  {p['verdict'].title()}", "share", s, "want")
             if ideas:
                 with st.expander(f"New ideas ({len(ideas)})", expanded=False):
                     for r in ideas:
-                        nav(f"{short(r['symbol'])}  {r['action'][:18]}", "share", r["symbol"])
+                        nav(f"{short(r['symbol'])}  {r['action'][:18]}", "share", r["symbol"], "idea")
         st.divider()
         nav("📝 Paper trades", "paper")
         nav("🧪 Historical check", "history")
@@ -163,14 +163,26 @@ def sidebar(data):
 
 # ------------------------------------------------------------------ chart
 def price_chart(sym, r, held_row=None, want_row=None, height=520):
-    bars = resample(store.load(sym, "1m"), cfg.INTRA_RULE)
+    span = st.radio("Range", ["Live", "1D", "5D", "1M", "1Y"], horizontal=True, key=f"rng_{sym}_{height}",
+                    label_visibility="collapsed",
+                    help="Live = last 90 min with a tick every 2 min · 1D/5D = intraday candles · 1M/1Y = daily candles")
+    intraday = span in ("Live", "1D", "5D")
+    if intraday:
+        bars = resample(store.load(sym, "1m"), cfg.INTRA_RULE)
+        if not bars.empty and span != "Live":
+            sessions = sorted(set(bars.index.normalize()))[-(5 if span == "5D" else 1):]
+            bars = bars[bars.index.normalize() >= sessions[0]]
+    else:
+        bars = store.load(sym, "1d")
+        if not bars.empty:
+            bars = bars[bars.index >= bars.index[-1] - pd.Timedelta(days=30 if span == "1M" else 365)]
     if bars.empty:
-        st.info(f"No intraday data stored for {sym} yet.")
+        st.info(f"No {'intraday' if intraday else 'daily'} data stored for {sym} yet.")
         return
-    bars = bars[bars.index >= bars.index[-1].normalize() - pd.Timedelta(days=3)]
-    b = add_all(bars, intraday=True)
+    b = add_all(bars, intraday=intraday)
     fig = go.Figure(go.Candlestick(x=b.index, open=b.open, high=b.high, low=b.low, close=b.close, name=sym))
-    fig.add_trace(go.Scatter(x=b.index, y=b.vwap, name="VWAP", line=dict(width=1.2)))
+    if intraday:
+        fig.add_trace(go.Scatter(x=b.index, y=b.vwap, name="VWAP", line=dict(width=1.2)))
     fig.add_trace(go.Scatter(x=b.index, y=b.ema20, name="EMA20", line=dict(width=1.2)))
     pat = detect(b)
     for name, bias in BIAS.items():
@@ -197,7 +209,20 @@ def price_chart(sym, r, held_row=None, want_row=None, height=520):
     fig.add_hline(y=r["support"], line_dash="dot", line_color="gray", annotation_text="Support")
     if r["resistance"]:
         fig.add_hline(y=r["resistance"], line_dash="dot", line_color="gray", annotation_text="Resistance")
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]), dict(bounds=[15.5, 9.25], pattern="hour")])
+    if intraday:
+        days = pd.date_range(b.index[0].normalize(), b.index[-1].normalize() + pd.Timedelta(days=1), freq="D")
+        off_days = [d.strftime("%Y-%m-%d") for d in days
+                    if d.weekday() >= 5 and d.strftime("%Y-%m-%d") not in cfg.SPECIAL_SESSIONS]   # weekends, except special sessions
+        fig.update_xaxes(rangebreaks=[dict(values=off_days), dict(bounds=[15.5, 9.25], pattern="hour")])
+        if span == "Live":    # last 90 min, a tick every 2 minutes, date included
+            fig.update_xaxes(dtick=2 * 60 * 1000, tickformat="%d %b %H:%M", tickangle=-90, tickfont=dict(size=9),
+                             range=[b.index[-1] - pd.Timedelta(minutes=90), b.index[-1] + pd.Timedelta(minutes=10)])
+        elif span == "1D":
+            fig.update_xaxes(dtick=30 * 60 * 1000, tickformat="%H:%M<br>%d %b")
+        else:
+            fig.update_xaxes(tickformat="%d %b<br>%H:%M")
+    else:
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], tickformat="%d %b %Y" if span == "1Y" else "%d %b")
     fig.update_layout(height=height, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, width="stretch")
 
@@ -544,5 +569,5 @@ else:
     content()
 
 st.divider()
-st.caption("Created by **Suman Karmakar** · Contact: sumank.turbo@gmail.com · Demo for educational/guide purposes only · "
-           "AI-generated suggestions · Investments are subject to market risk. Read all related documents carefully.")
+st.caption("Created by **Suman Karmakar** · Contact: sumank.turbo@gmail.com · Demo for educational/guide purposes only · AI-generated suggestions · "
+           "Investments are subject to market risk. Read all related documents carefully.")

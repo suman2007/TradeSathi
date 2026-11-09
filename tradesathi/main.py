@@ -30,7 +30,7 @@ normalize = hd.normalize
 
 
 def market_open(now):
-    return now.weekday() < 5 and dt.time(9, 15) <= now.time() <= dt.time(15, 30)  # exchange holidays not handled
+    return cfg.market_open(now)   # honours cfg.SPECIAL_SESSIONS (e.g. Diwali Muhurat)
 
 
 def refresh(src, store, sym, daily_due):
