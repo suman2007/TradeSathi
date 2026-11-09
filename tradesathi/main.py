@@ -43,44 +43,46 @@ def refresh(src, store, sym, daily_due):
         raise ValueError("no price data found - check the symbol spelling (use the NSE symbol, e.g. RELIANCE)")
 
 
-def run_cycle(src, store, symbols, capital, now, daily_due, held=None, wants=None):
-    held, wants = held or {}, wants or {}
-    watch = list(dict.fromkeys(list(symbols) + list(held) + list(wants)))   # ideas + what you own + what you want to buy
-    results = []
-    for sym in watch:
-        try:
-            refresh(src, store, sym, daily_due)
-            res = analyze(sym, store.load(sym, "1d"), store.load(sym, "1m"), pd.Timestamp(now))
-            history.apply(res, history.stats_for(src, store, sym, pd.Timestamp(now)))   # historical record + edge gate
-            results.append(res)
-        except Exception as e:  # one bad symbol must not stop the loop
-            results.append({"symbol": sym, "error": str(e)})
-    by_sym = {r["symbol"]: r for r in results if "error" not in r}
+def analyze_symbol(src, store, sym, now, daily_due):
+    """Download/top up the candles, score the share, attach its historical record. Raises on bad data."""
+    refresh(src, store, sym, daily_due)
+    res = analyze(sym, store.load(sym, "1d"), store.load(sym, "1m"), pd.Timestamp(now))
+    history.apply(res, history.stats_for(src, store, sym, pd.Timestamp(now)))   # historical record + edge gate
+    return res
 
-    # --- manage positions you already hold (stops only ever move up, remembered between cycles) ---
-    prev, new_stops, rows = store.read_json("stops.json"), {}, []
+
+def _err(results, sym):
+    return next((x["error"] for x in results if x["symbol"] == sym), "no data")
+
+
+def manage_holdings(by_sym, results, held, prev, now, track_days=True):
+    """Manage positions you already hold (stops only ever move up, remembered between cycles).
+    `prev` = the stops from the last cycle. Returns (rows, new_stops). track_days=False skips the time-limit exit
+    (a visitor's holdings have no first-seen date to count from)."""
+    new_stops, rows = {}, []
     for sym, h in held.items():
         r = by_sym.get(sym)
         if r is None:
-            rows.append({"symbol": sym, "qty": h["qty"], "buy_price": round(h["buy_price"], 2),
-                         "error": next((x["error"] for x in results if x["symbol"] == sym), "no data")})
+            rows.append({"symbol": sym, "qty": h["qty"], "buy_price": round(h["buy_price"], 2), "error": _err(results, sym)})
             continue
         key = f"{sym}|{h['buy_price']:.2f}"
         p_old = prev.get(key)
         since = (p_old.get("since") if isinstance(p_old, dict) else None) or now.date().isoformat()   # first day we saw it
-        days_held = int(np.busday_count(since, now.date().isoformat()))   # weekdays; exchange holidays are not handled
+        days_held = int(np.busday_count(since, now.date().isoformat())) if track_days else None   # weekdays; holidays not handled
         m = manage(r, h["qty"], h["buy_price"], p_old, days_held)
         new_stops[key] = {"stop": m["stop"], "r": m["r"], "since": since}
         rows.append(m)
-    store.write_json("stops.json", new_stops)
+    return rows, new_stops
 
-    # --- "when should I buy?" for the shares you asked about ---
-    # a BUY NOW must hold CONFIRM_CYCLES cycles in a row before it is confirmed / alerted (filters one-minute flickers)
-    prev_v, new_v, buys = store.read_json("buy_state.json"), {}, []
+
+def plan_buys(by_sym, results, wants, prev_v):
+    """"When should I buy?" for the shares you asked about. A BUY NOW must hold CONFIRM_CYCLES cycles in a row before
+    it is confirmed / alerted (filters one-minute flickers). Returns (plans, new_state)."""
+    new_v, buys = {}, []
     for sym, w in wants.items():
         r = by_sym.get(sym)
         if r is None:
-            buys.append({"symbol": sym, "error": next((x["error"] for x in results if x["symbol"] == sym), "no data")})
+            buys.append({"symbol": sym, "error": _err(results, sym)})
             if sym in prev_v:
                 new_v[sym] = prev_v[sym]
             continue
@@ -95,6 +97,24 @@ def run_cycle(src, store, symbols, capital, now, daily_due, held=None, wants=Non
                                  f"(about {cfg.CONFIRM_CYCLES * cfg.REFRESH_SECONDS // 60} min) before acting.")
         new_v[sym] = {"verdict": p["verdict"], "streak": streak}
         buys.append(p)
+    return buys, new_v
+
+
+def run_cycle(src, store, symbols, capital, now, daily_due, held=None, wants=None):
+    held, wants = held or {}, wants or {}
+    watch = list(dict.fromkeys(list(symbols) + list(held) + list(wants)))   # ideas + what you own + what you want to buy
+    results = []
+    for sym in watch:
+        try:
+            results.append(analyze_symbol(src, store, sym, now, daily_due))
+        except Exception as e:  # one bad symbol must not stop the loop
+            results.append({"symbol": sym, "error": str(e)})
+    by_sym = {r["symbol"]: r for r in results if "error" not in r}
+
+    rows, new_stops = manage_holdings(by_sym, results, held, store.read_json("stops.json"), now)
+    store.write_json("stops.json", new_stops)
+
+    buys, new_v = plan_buys(by_sym, results, wants, store.read_json("buy_state.json"))
     store.write_json("buy_state.json", new_v)
 
     # --- new-entry plan for the rest of the list (held / wanted symbols have their own sections) ---

@@ -15,7 +15,7 @@ import streamlit as st
 
 from tradesathi.storage import buylist as bl
 from tradesathi import config as cfg
-from tradesathi import engine
+from tradesathi import engine, mode, visitor
 from tradesathi.storage import holdings as hd
 from tradesathi.analysis import paper
 from tradesathi.storage import persist
@@ -28,6 +28,7 @@ from tradesathi.analysis.strategy import resample
 st.set_page_config(page_title="Trading Analyzer", layout="wide", initial_sidebar_state="expanded")
 store = Store()
 IST = ZoneInfo(cfg.TZ_NAME)
+PUBLIC = mode.is_public()      # public URL: every visitor's lists live only in their own browser tab
 
 
 def _secret(name):
@@ -48,7 +49,8 @@ if _pw and not st.session_state.get("authed"):
         st.error("Wrong password.")
     st.stop()
 
-engine.ensure_started()         # background analysis thread (skipped if TRADESATHI_EXTERNAL_ENGINE=1, i.e. python -m tradesathi.main runs the engine)
+if not PUBLIC:
+    engine.ensure_started()     # background analysis thread (skipped if TRADESATHI_EXTERNAL_ENGINE=1, i.e. python -m tradesathi.main runs the engine)
 VERDICT_DOT = {"BUY NOW": "🟢", "PLACE LIMIT ORDER": "🔵", "WAIT": "🟡", "DO NOT BUY": "🔴"}
 st.session_state.setdefault("page", "overview")
 st.session_state.setdefault("sym", None)
@@ -56,6 +58,8 @@ st.session_state.setdefault("sym", None)
 
 # ------------------------------------------------------------------ helpers
 def load_data():
+    if PUBLIC:
+        return visitor.visitor_data(st.session_state)
     path = os.path.join(cfg.DATA_DIR, "signals.json")
     if not os.path.exists(path):
         return None
@@ -108,7 +112,7 @@ def status_bar(updated_iso):
     c[0].metric("Data as of (IST)", upd.strftime("%d %b %Y, %H:%M:%S"), upd.strftime("%A"), delta_color="off")
     c[1].metric("Age of data", _age(age))
     c[2].metric("Market", "OPEN" if is_open else "CLOSED", f"now {now.strftime('%d %b %H:%M:%S')}", delta_color="off")
-    if is_open and age > 3 * cfg.REFRESH_SECONDS:
+    if is_open and not PUBLIC and age > 3 * cfg.REFRESH_SECONDS:
         st.error(f"Data is stale: last updated {_age(age)} while the market is open. "
                  "The analysis engine may have stopped: reload the page" +
                  (" or restart python -m tradesathi.main." if engine.external() else "."))
@@ -154,11 +158,17 @@ def sidebar(data):
                     for r in ideas:
                         nav(f"{short(r['symbol'])}  {r['action'][:18]}", "share", r["symbol"], "idea")
         st.divider()
-        nav("📝 Paper trades", "paper")
+        if not PUBLIC:
+            nav("📝 Paper trades", "paper")
         nav("🧪 Historical check", "history")
         nav("🛠 Manage lists", "manage")
-        nav("💡 New ideas table", "ideas")
-        st.caption(f"Your data is stored in: {persist.backend().name}")
+        if not PUBLIC:
+            nav("💡 New ideas table", "ideas")
+        if PUBLIC:
+            st.caption("🔒 Private to you: your lists exist only in this browser tab. Nothing is saved on the server; "
+                       "download them under Manage lists to keep them.")
+        else:
+            st.caption(f"Your data is stored in: {persist.backend().name}")
 
 
 # ------------------------------------------------------------------ chart
@@ -414,6 +424,8 @@ def page_paper(data):
 
 def page_history(data):
     hist = store.read_json("history.json")
+    if PUBLIC:                                        # history.json also holds shares other visitors looked at
+        hist = visitor.visitor_history(st.session_state, hist)
     if not hist:
         st.info("No historical check yet.")
         return
@@ -431,6 +443,15 @@ def page_history(data):
 
 
 # ---- list editing: outside the auto-refreshing part so edits are not lost ----
+def _save(module, df):
+    try:
+        module.save(df)
+        return True
+    except ValueError as e:                           # visitor mode: invalid symbol or too many shares
+        st.error(str(e))
+        return False
+
+
 def manage(key, module, columns, add_fields, ready):
     """Add form + editable table with a Delete tick-box. `ready(row)` says whether a new row is complete."""
     with st.form(f"{key}_add", clear_on_submit=True):
@@ -447,8 +468,8 @@ def manage(key, module, columns, add_fields, ready):
             if not row["symbol"] or not ready(row):
                 st.error("Fill in the symbol and the required numbers.")
             else:
-                module.save(pd.concat([module.read(), pd.DataFrame([row])], ignore_index=True))
-                st.rerun()
+                if _save(module, pd.concat([module.read(), pd.DataFrame([row])], ignore_index=True)):
+                    st.rerun()
 
     df = module.read()
     d1, d2 = st.columns([5, 1])
@@ -457,22 +478,49 @@ def manage(key, module, columns, add_fields, ready):
     d2.write("")
     d2.write("")
     if d2.button("Delete", key=f"{key}_delbtn") and gone:
-        module.save(df.drop(index=gone))
-        st.session_state.pop(f"{key}_del", None)
-        st.session_state.pop(f"{key}_editor", None)
-        st.rerun()
+        if _save(module, df.drop(index=gone)):
+            st.session_state.pop(f"{key}_del", None)
+            st.session_state.pop(f"{key}_editor", None)
+            st.rerun()
 
     edited = st.data_editor(df, num_rows="dynamic", width="stretch", key=f"{key}_editor", column_config=columns)
     if st.button("Save changes", key=f"{key}_save"):
-        module.save(edited)
-        st.rerun()
+        if _save(module, edited):
+            st.rerun()
+
+
+def backup_section(hold, buy):
+    """Visitor mode: the only way to keep a list is a file on the visitor's own device."""
+    st.divider()
+    st.subheader("Keep your lists")
+    st.caption("Nothing is saved on the server, so your lists disappear when you close or refresh this tab. "
+               "Download them to your own device and upload them next time.")
+    cols = st.columns(2)
+    for col, label, lst, fname, key in ((cols[0], "holdings", hold, "holdings.csv", "hold"),
+                                        (cols[1], "buy list", buy, "buylist.csv", "buy")):
+        col.download_button(f"Download my {label}", lst.csv(), file_name=fname, mime="text/csv", key=f"dl_{key}")
+        up = col.file_uploader(f"Upload {label} (CSV)", type="csv", key=f"up_{key}")
+        if up is not None:
+            fid = getattr(up, "file_id", None) or f"{up.name}:{up.size}"
+            if st.session_state.get(f"up_{key}_done") != fid:
+                try:
+                    lst.upload(up.getvalue())
+                    st.session_state[f"up_{key}_done"] = fid
+                    st.rerun()
+                except ValueError as e:
+                    col.error(str(e))
 
 
 def page_manage():
+    hold_mod, buy_mod = visitor.session_lists(st.session_state) if PUBLIC else (hd, bl)
+    if PUBLIC:
+        st.info(f"🔒 **Private to you.** The lists you add exist only in this browser tab: nobody else can see them "
+                f"and nothing is stored on the server. Up to {cfg.MAX_SYMBOLS_PER_VISITOR} different shares of your own "
+                f"(holdings and buy list together; the default list does not count).")
     st.subheader("My holdings (shares I already bought)")
     st.caption("Add a purchase with the form, edit cells directly, or pick rows and click Delete. Several rows for the "
                "same share are merged at the average price. The engine picks up changes within a minute.")
-    manage("hold", hd, {
+    manage("hold", hold_mod, {
         "symbol": st.column_config.TextColumn("Symbol (e.g. RELIANCE)"),
         "qty": st.column_config.NumberColumn("Quantity", min_value=1, step=1),
         "buy_price": st.column_config.NumberColumn("Buy price", min_value=0.01, format="%.2f"),
@@ -480,9 +528,15 @@ def page_manage():
         lambda r: r["qty"] and r["buy_price"])
     st.divider()
     st.subheader("Shares I want to BUY")
+    if PUBLIC:
+        st.markdown("**Default buy list**: shown to every visitor, cannot be changed or removed.")
+        st.dataframe(buy_mod.locked.rename(columns={"symbol": "Symbol", "amount": "Amount to invest", "qty": "Quantity",
+                                                    "max_price": "Max price (optional)"}),
+                     hide_index=True, width="stretch")
+        st.markdown("**Your own additions**")
     st.caption("Fill Amount (rupees to invest) OR Quantity. Max price is optional: the most you will pay per share. "
                "The engine tells you when and at what price to buy, within a minute of saving.")
-    manage("buy", bl, {
+    manage("buy", buy_mod, {
         "symbol": st.column_config.TextColumn("Symbol (e.g. TCS)"),
         "amount": st.column_config.NumberColumn("Amount to invest", min_value=1.0, step=1000.0, format="%.0f"),
         "qty": st.column_config.NumberColumn("or Quantity", min_value=1, step=1),
@@ -490,6 +544,8 @@ def page_manage():
     }, [("symbol", "Symbol", "text"), ("amount", "Amount to invest", "num"), ("qty", "or Quantity", "num"),
         ("max_price", "Max price (optional)", "num")],
         lambda r: r["amount"] or r["qty"])
+    if PUBLIC:
+        backup_section(hold_mod, buy_mod)
 
 
 # ------------------------------------------------------------------ main
@@ -497,8 +553,7 @@ PAGES = {"overview": page_overview, "share": page_share, "ideas": page_ideas, "p
          "history": page_history}
 
 
-@st.fragment(run_every="30s")
-def content():
+def _content():
     data = load_data()
     if data is None:
         if engine.external():
@@ -511,6 +566,13 @@ def content():
         return
     if data["updated"] != st.session_state.get("sb_ts"):
         st.rerun()                                      # new engine cycle: rebuild the left pane too
+    if PUBLIC and not visitor.has_own_lists(st.session_state):
+        st.info("👋 **Welcome.** You are looking at the default buy list. Add the shares you own or want to buy under "
+                "**🛠 Manage lists** (left pane); your lists stay private to this browser tab.")
+    if data.get("pending"):
+        st.info(f"Analysing {len(data['pending'])} share(s): {', '.join(short(x) for x in data['pending'])}. "
+                "The first analysis of a share downloads its price history and can take a minute. "
+                "This page updates by itself.")
     PAGES[st.session_state.page](data)
 
 
@@ -566,7 +628,7 @@ st.session_state.sb_ts = _data["updated"] if _data else None
 if st.session_state.page == "manage":
     page_manage()
 else:
-    content()
+    st.fragment(run_every="3s" if (_data or {}).get("pending") else "30s")(_content)()
 
 st.divider()
 st.caption("Created by **Suman Karmakar** · Contact: sumank.turbo@gmail.com · Demo for educational/guide purposes only · AI-generated suggestions · "

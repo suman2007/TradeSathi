@@ -1,6 +1,10 @@
 """Attach each share's historical record to its live signal (cached once per day)."""
+import threading
+
 from tradesathi import config as cfg
 from tradesathi.analysis import backtest
+
+_LOCK = threading.Lock()      # history.json is shared by the engine and the visitor workers
 
 KEYS = ("edge", "trades", "win_rate", "expectancy_r", "profit_factor", "max_dd_pct", "cagr_pct",
         "buy_hold_cagr_pct", "years", "avg_win_r", "avg_loss_r", "t_stat", "method", "history_bars", "history_years")
@@ -16,8 +20,8 @@ def stats_for(src, store, sym, now):
     """Backtest stats for one share. Never raises: a failure just means no history is shown.
     Uses the intraday replay of the live rules when enough 5-min history exists, otherwise the daily version."""
     try:
-        cache = store.read_json("history.json")
-        e = cache.get(sym)
+        with _LOCK:
+            e = store.read_json("history.json").get(sym)
         if e and e["asof"] == now.date().isoformat() and e.get("settings") == _settings():
             return e["stats"]
         print(f"  running historical check for {sym} ...")
@@ -35,8 +39,10 @@ def stats_for(src, store, sym, now):
             stats["edge"] = NO_HISTORY
             stats["history_bars"] = len(d)
             stats["history_years"] = round((d.index[-1] - d.index[0]).days / 365.25, 2) if len(d) else 0.0
-        cache[sym] = {"asof": now.date().isoformat(), "settings": _settings(), "stats": stats}
-        store.write_json("history.json", cache)
+        with _LOCK:                                   # re-read: another thread may have added shares meanwhile
+            cache = store.read_json("history.json")
+            cache[sym] = {"asof": now.date().isoformat(), "settings": _settings(), "stats": stats}
+            store.write_json("history.json", cache)
         return stats
     except Exception as ex:
         print(f"  historical check failed for {sym}: {ex}")

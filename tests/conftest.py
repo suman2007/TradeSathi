@@ -36,6 +36,15 @@ class FakeSource:
                              "volume": rng.integers(1000, 5000, len(idx)).astype(float)}, index=idx)
 
 
+def _reset_secrets():
+    """Streamlit parses secrets.toml once per process: forget it so one test's secrets never leak into the next."""
+    import streamlit as st
+    try:
+        st.secrets._reset()
+    except Exception:
+        pass
+
+
 @pytest.fixture
 def workdir(tmp_path, monkeypatch):
     """Run in an empty folder (holdings.csv, data/ ... are relative paths) with local file storage."""
@@ -43,8 +52,10 @@ def workdir(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADESATHI_EXTERNAL_ENGINE", "1")
     monkeypatch.setenv("TRADESATHI_STORAGE", "local")
     persist.reset()
+    _reset_secrets()
     yield tmp_path
     persist.reset()
+    _reset_secrets()
 
 
 @pytest.fixture

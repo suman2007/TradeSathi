@@ -66,3 +66,12 @@ CONFIRM_CYCLES = 2              # a BUY NOW must hold this many consecutive cycl
 SPLIT_ENTRY = True       # split a buy in two: half at the entry price, half at the bottom of the buy zone
 MAX_STOP_PCT = 8.0       # warn when the stop is further than this % below the entry
 EXTENDED_ATR = 1.5       # "do not chase" warning when price is this many ATR above the buy zone
+
+# --- public (visitor) mode: every visitor's lists live only in their own browser tab ---
+MAX_SYMBOLS_PER_VISITOR = 10    # different shares one visitor may track (holdings + buy list together)
+MAX_TOTAL_SYMBOLS = 40          # different shares the server analyses for all visitors together (disk, memory, rate limits)
+VISITOR_TTL_CLOSED = 900        # seconds a share's analysis is reused while the market is closed
+
+# Buy list shown to EVERY visitor in public mode (symbol, quantity). Visitors cannot change or remove it, and it does
+# not count toward their own MAX_SYMBOLS_PER_VISITOR. Use NSE trading symbols (Reliance is RELIANCE, not RIL).
+PUBLIC_DEFAULT_BUYLIST = [("TCS", 100), ("RELIANCE", 100), ("INFY", 100), ("WIPRO", 100), ("ADANIENT", 100)]

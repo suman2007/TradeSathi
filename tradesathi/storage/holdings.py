@@ -14,8 +14,8 @@ def normalize(sym):
     return s if s.endswith((".NS", ".BO")) else s + ".NS"
 
 
-def read(path=PATH):
-    text = persist.read_text(path, seed=path)
+def parse(text):
+    """CSV text -> tidy DataFrame (also used for a file a visitor uploads)."""
     df = pd.read_csv(io.StringIO(text)) if text and text.strip() else pd.DataFrame(columns=COLS)
     df.columns = [str(c).strip().lower() for c in df.columns]
     for c in COLS:
@@ -28,16 +28,28 @@ def read(path=PATH):
     return df
 
 
-def save(df, path=PATH):
+def read(path=PATH):
+    return parse(persist.read_text(path, seed=path))
+
+
+def clean(df):
+    """What gets stored: upper-case symbols, complete rows only."""
     df = df.copy()
     df["symbol"] = df["symbol"].fillna("").astype(str).str.strip().str.upper()
     df = df[df["symbol"] != ""].dropna(subset=["qty", "buy_price"])
-    persist.write_text(path, df[COLS].to_csv(index=False))
+    return df[COLS]
+
+
+def save(df, path=PATH):
+    persist.write_text(path, clean(df).to_csv(index=False))
 
 
 def load(path=PATH, extra=None):
     """Return {SYMBOL.NS: {"qty": q, "buy_price": avg}}. `extra` = ["RELIANCE:10:2450.5", ...] from the CLI."""
-    df = read(path)
+    return from_df(read(path), extra)
+
+
+def from_df(df, extra=None):
     rows = []
     for s in extra or []:
         sym, qty, price = s.split(":")

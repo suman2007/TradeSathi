@@ -7,6 +7,7 @@ import datetime as dt
 import gzip
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -59,9 +60,14 @@ class UpstoxSource(DataSource):
     def __init__(self, cache_dir=cfg.DATA_DIR):
         self.cache_dir = cache_dir
         self._keys = {}
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------ symbol -> instrument key
     def _instrument_map(self, exch):
+        with self._lock:                                    # several worker threads may ask at once
+            return self._instrument_map_locked(exch)
+
+    def _instrument_map_locked(self, exch):
         if exch not in self._keys:
             path = os.path.join(self.cache_dir, f"upstox_{exch}.json.gz")
             fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < 86400

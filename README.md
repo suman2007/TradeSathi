@@ -66,28 +66,59 @@ venv\Scripts\python -m streamlit run dashboard.py
 It starts its own engine thread. To test the password gate or Google Sheets storage locally, copy
 `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill it in (that file is git-ignored).
 
-## Deploying to Streamlit Community Cloud
-1. **Make the GitHub repo private** (holdings.csv / buylist.csv are in it). Community Cloud can deploy private repos.
-2. **Persistent storage (recommended).** The cloud disk is wiped on every restart. To keep holdings, buy list, paper trades
-   and trailing stops: create a Google Cloud service account (Sheets API + Drive API enabled), download its JSON key,
-   create an empty Google Sheet and share it (Editor) with the service account's `client_email`. The first start copies
-   your committed holdings.csv / buylist.csv into the sheet (tab `tradesathi_kv`); after that the sheet is the source of truth.
-3. **Create the app** at share.streamlit.io: repo, branch `main`, main file `dashboard.py`. In *Advanced settings* choose
-   Python 3.12 and paste the contents of `.streamlit/secrets.toml.example` (filled in) into *Secrets*.
-4. **Restrict access**: set `app_password` in the secrets (the dashboard asks for it), and/or use the app's
-   *Sharing* settings to allow only your email.
+## Two modes: public and owner
+| | **public** (for a URL you share) | **owner** (your own private tool) |
+|---|---|---|
+| Who it is for | anyone who opens the link | you only |
+| Lists (holdings, buy list) | live **only in the visitor's own browser tab**; nothing is stored on the server | stored: local files, or Google Sheets on the cloud |
+| Can visitors see each other's shares? | **No.** Each visitor has a separate session | n/a (single user) |
+| Keeping a list | visitor downloads / uploads a CSV (Manage lists page) | automatic |
+| Default buy list | a built-in list every visitor sees; **cannot be edited or deleted** | none |
+| Paper trades, saved trailing stops | not available | yes |
+| Limits | 10 different shares per visitor, 40 shares on the whole server | none |
 
-Things to know: the engine runs as a thread inside the app, so it only runs while the app is awake (Community Cloud
-puts idle apps to sleep after ~12 hours without visitors; opening the URL wakes it). Candle history and the historical
-check are rebuilt after each restart (first start takes several minutes). Paper trades therefore only advance while
-the app is awake. Free data from cloud IPs can be rate limited: errors show per share in the dashboard.
+The mode is chosen automatically: **on Streamlit Community Cloud the app starts in public mode**, anywhere else (your
+computer) in owner mode. So a forgotten setting can never expose a private portfolio. Override it with the app secret
+`mode = "owner"` or `"public"` (or the environment variable `TRADESATHI_MODE`).
+
+The default buy list for public mode is `PUBLIC_DEFAULT_BUYLIST` in `tradesathi/config.py` (currently TCS, RELIANCE,
+INFY, WIPRO, ADANIENT, 100 shares each; use NSE trading symbols). It is shown first on every visitor's Manage lists
+page in a read-only table, it does not count toward their 10-share limit, and a visitor cannot change, remove or
+re-add it. Visitors add their own shares below it.
+
+In public mode the server keeps only anonymous market data (candles and each share's analysis, shared by all visitors
+to stay fast). It never writes a visitor's holdings, buy list, stops or paper trades anywhere, and the historical-check
+page shows a visitor only the shares in their own lists.
+
+## Deploying to Streamlit Community Cloud
+### A. Public app (share this link)
+1. Create the app at share.streamlit.io: repo, branch `main`, main file `dashboard.py`, *Advanced settings* -> Python 3.12.
+2. That is all: no secrets are needed. Do not add `[storage]` or `app_password` here (optional: `app_password` makes
+   everyone enter one shared password first).
+3. Your own holdings.csv / buylist.csv in the repo are **not** used in public mode.
+
+### B. Your private copy (your real portfolio)
+1. Deploy the same repo a second time (a different app URL) from a **private** GitHub repo or fork.
+2. In its *Secrets* set `mode = "owner"`, an `app_password`, and (so your lists survive restarts, because the cloud
+   disk is wiped) a `[storage]` section: create a Google Cloud service account (Sheets API + Drive API enabled),
+   download its JSON key, create an empty Google Sheet and share it (Editor) with the service account's `client_email`.
+   Use `.streamlit/secrets.toml.example` as the template. The first start copies your committed holdings.csv /
+   buylist.csv into the sheet (tab `tradesathi_kv`); after that the sheet is the source of truth.
+3. Optionally also restrict viewers in the app's *Sharing* settings.
+
+Things to know: apps sleep after ~12 hours without visitors (opening the URL wakes them) and their disk is wiped on
+restart, so candle history and historical checks are rebuilt (the first analysis of a share takes about a minute).
+In owner mode the engine is a thread inside the app, so paper trades only advance while the app is awake. Free data
+from cloud IPs can be rate limited: errors show per share in the dashboard.
 
 ## Project layout
 ```
 dashboard.py              Streamlit entry point (the "main file" on Streamlit Cloud)
 tradesathi/
   config.py               all settings
-  engine.py               background analysis thread used by the dashboard
+  engine.py               owner mode: background analysis thread used by the dashboard
+  mode.py                 public / owner mode switch
+  visitor.py              public mode: per-visitor lists, shared price cache, symbol validation
   main.py                 the analysis cycle + terminal mode (python -m tradesathi.main)
   data_source.py          free market-data sources (Upstox, Yahoo)
   storage/                persist.py (local files or Google Sheets), store.py (candles, JSON), holdings.py, buylist.py
@@ -95,6 +126,6 @@ tradesathi/
                           backtest, history (historical check), paper (paper trading)
 tests/                    offline tests (python -m pytest)
 .streamlit/               secrets.toml.example
-holdings.csv, buylist.csv your lists (seed the Google Sheet on first cloud start)
+holdings.csv, buylist.csv your lists in owner mode (seed the Google Sheet on first cloud start)
 data/                     local cache of candles and results (git-ignored, recreated automatically)
 ```
